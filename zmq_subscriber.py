@@ -2,6 +2,7 @@
 High-performance ZeroMQ Subscriber for numpy arrays with true zero-copy reception.
 Uses ZMQ's zero-copy message API for maximum performance with async/await.
 """
+
 import asyncio
 import zmq
 import zmq.asyncio
@@ -12,9 +13,13 @@ import argparse
 import numpy as np
 from typing import Optional, Tuple
 
+from utils import ConstantRateExecutor
+
 
 class FastArraySubscriber:
-    def __init__(self, ipc_path: str = "/tmp/0", process_rate_hz: float = 1000.0):
+    def __init__(
+        self, ipc_path: str = "/tmp/0", process_rate_hz: float = 1000.0, stats_hz: float = 1.0
+    ):
         """
         Initialize zero-copy subscriber.
 
@@ -28,14 +33,18 @@ class FastArraySubscriber:
         # High-performance socket options
         self.socket.setsockopt(zmq.RCVHWM, 1000)
         self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.setsockopt(zmq.RCVBUF, 0)  # Use ZMQ buffering
+        self.socket.setsockopt(zmq.RCVBUF, 100)  # Use ZMQ buffering
 
         self.socket.connect(f"ipc://{ipc_path}")
         self.socket.setsockopt_string(zmq.SUBSCRIBE, "data")
 
-        self.process_interval = 1.0 / process_rate_hz
+        self.stats_hz = stats_hz
+        self.process_rate_hz = process_rate_hz
         self.header_struct = struct.Struct("!QIIII")
         self.running = False
+
+        self._process_executor = ConstantRateExecutor(process_rate_hz, self._process_single)
+        self._stats_executor = ConstantRateExecutor(stats_hz, self._stats_single)
 
         print(f"Subscriber connected to ipc://{ipc_path}")
 
@@ -55,23 +64,16 @@ class FastArraySubscriber:
         """
         return np.frombuffer(msg.buffer, dtype=dtype).reshape(shape)
 
-    async def receive_array(
-        self, timeout_ms: int = 0
-    ) -> Optional[Tuple[np.ndarray, int, zmq.Message]]:
+    async def receive_array(self) -> Optional[Tuple[np.ndarray, int, zmq.Message]]:
         """
         Receive numpy array with true zero-copy.
-
-        Args:
-            timeout_ms: Timeout in milliseconds (0 for non-blocking)
 
         Returns:
             Tuple of (array, message_counter, zmq_message) or None
             Note: Keep zmq_message alive as long as you need the array!
         """
         try:
-            flags = zmq.NOBLOCK if timeout_ms == 0 else 0
-
-            messages = await self.socket.recv_multipart(flags, copy=False)
+            messages = await self.socket.recv_multipart(zmq.NOBLOCK, copy=False)
 
             if len(messages) != 5:
                 print(f"Warning: Expected 5 parts, got {len(messages)}")
@@ -96,12 +98,9 @@ class FastArraySubscriber:
             print(f"Error receiving array: {e}")
             return None
 
-    async def run_realtime_mode(self, stats_interval: float = 1.0):
+    async def run_realtime_mode(self):
         """
         Run subscriber in real-time mode - process latest available data.
-
-        Args:
-            stats_interval: How often to print stats
         """
         print("Starting async real-time mode reception...")
 
@@ -117,8 +116,8 @@ class FastArraySubscriber:
         self.running = True
 
         receive_task = asyncio.create_task(self._receive_loop(stats))
-        process_task = asyncio.create_task(self._process_loop(stats))
-        stats_task = asyncio.create_task(self._stats_loop(start_time, stats, stats_interval))
+        process_task = asyncio.create_task(self._process_executor.run(stats))
+        stats_task = asyncio.create_task(self._stats_executor.run(start_time, stats))
 
         tasks = [receive_task, process_task, stats_task]
         try:
@@ -129,6 +128,8 @@ class FastArraySubscriber:
             print("\nCancelling subscriber tasks...")
         finally:
             self.running = False
+            self._process_executor.stop()
+            self._stats_executor.stop()
 
             for task in tasks:
                 if not task.done():
@@ -175,49 +176,29 @@ class FastArraySubscriber:
                 print(f"Error in receive loop: {e}")
                 await asyncio.sleep(0.001)
 
-    async def _stats_loop(self, start_time: float, stats: dict, interval: float):
+    async def _stats_single(self, start_time: float, stats: dict):
         """Internal stats reporting loop."""
-        while self.running:
-            await asyncio.sleep(interval)
+        elapsed = time.perf_counter() - start_time
+        recv_rate = stats["received_count"] / elapsed if elapsed > 0 else 0
+        proc_rate = stats["processed_count"] / elapsed if elapsed > 0 else 0
 
-            if not self.running:
-                break
+        if hasattr(self, "latest_array") and self.latest_array is not None:
+            array_size_mb = self.latest_array.nbytes / 1024 / 1024
+            throughput_mbps = (stats["received_count"] * array_size_mb * 8) / elapsed / 1000
 
-            elapsed = time.perf_counter() - start_time
-            recv_rate = stats["received_count"] / elapsed if elapsed > 0 else 0
-            proc_rate = stats["processed_count"] / elapsed if elapsed > 0 else 0
+            print(
+                f"Received: {stats['received_count']}, Processed: {stats['processed_count']}, "
+                f"Dropped: {stats['dropped_messages']}, "
+                f"Recv Rate: {recv_rate:.1f} Hz, "
+                f"Proc Rate: {proc_rate:.1f} Hz, "
+                f"Throughput: {throughput_mbps:.1f} Mbps"
+            )
 
-            if hasattr(self, "latest_array") and self.latest_array is not None:
-                array_size_mb = self.latest_array.nbytes / 1024 / 1024
-                throughput_mbps = (stats["received_count"] * array_size_mb * 8) / elapsed / 1000
-
-                print(
-                    f"Received: {stats['received_count']}, Processed: {stats['processed_count']}, "
-                    f"Dropped: {stats['dropped_messages']}, "
-                    f"Recv Rate: {recv_rate:.1f} Hz, "
-                    f"Proc Rate: {proc_rate:.1f} Hz, "
-                    f"Throughput: {throughput_mbps:.1f} Mbps"
-                )
-
-    async def _process_loop(self, stats: dict):
+    async def _process_single(self, stats: dict):
         """Internal process loop"""
-        next_process_time = time.perf_counter()
-
-        while self.running:
-            current_time = time.perf_counter()
-
-            if current_time >= next_process_time:
-                if hasattr(self, "latest_array") and self.latest_array is not None:
-                    await self.process_array(self.latest_array, self.latest_counter)
-                    stats["processed_count"] += 1
-
-                next_process_time += self.process_interval
-
-            sleep_time = max(0, next_process_time - time.perf_counter())
-            if sleep_time > 0:
-                await asyncio.sleep(min(sleep_time, 0.001))
-            else:
-                await asyncio.sleep(0)  # Yield control
+        if hasattr(self, "latest_array") and self.latest_array is not None:
+            await self.process_array(self.latest_array, self.latest_counter)
+            stats["processed_count"] += 1
 
     async def process_array(self, array: np.ndarray, msg_counter: int):
         """
@@ -238,6 +219,9 @@ class FastArraySubscriber:
     async def close(self):
         """Clean shutdown."""
         self.running = False
+        self._process_executor.stop()
+        self._stats_executor.stop()
+        print("Closing subscriber...")
         self.socket.close()
         self.context.term()
 
@@ -246,16 +230,14 @@ async def main():
     parser = argparse.ArgumentParser(description="Zero-copy ZMQ numpy array subscriber")
     parser.add_argument("--ipc-path", type=str, default="/tmp/0", help="IPC path to connect to")
     parser.add_argument("--process-rate-hz", type=float, default=1000.0, help="Process rate in Hz")
-    parser.add_argument(
-        "--stats-interval", type=float, default=1.0, help="Stats interval in seconds"
-    )
+    parser.add_argument("--stats-hz", type=float, default=1.0, help="Stats hz in hz")
 
     args = parser.parse_args()
 
-    subscriber = FastArraySubscriber(args.ipc_path, args.process_rate_hz)
+    subscriber = FastArraySubscriber(args.ipc_path, args.process_rate_hz, args.stats_hz)
 
     try:
-        await subscriber.run_realtime_mode(args.stats_interval)
+        await subscriber.run_realtime_mode()
     except KeyboardInterrupt:
         print("\nStopping subscriber...")
     finally:

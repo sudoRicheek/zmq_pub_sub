@@ -2,6 +2,7 @@
 High-performance ZeroMQ Publisher for numpy arrays with zero-copy optimization.
 Sends numpy arrays at a constant rate using asyncio for precise timing.
 """
+
 import asyncio
 import zmq
 import zmq.asyncio
@@ -10,9 +11,13 @@ import time
 import struct
 import numpy as np
 
+from utils import ConstantRateExecutor
+
 
 class FastArrayPublisher:
-    def __init__(self, ipc_path: str = "/tmp/0", send_rate_hz: float = 1000.0):
+    def __init__(
+        self, ipc_path: str = "/tmp/0", send_rate_hz: float = 1000.0, stats_hz: float = 1.0
+    ):
         """
         Initialize high-performance publisher.
 
@@ -30,7 +35,8 @@ class FastArrayPublisher:
 
         self.socket.bind(f"ipc://{ipc_path}")
 
-        self.send_interval = 1.0 / send_rate_hz
+        self.stats_hz = stats_hz
+        self.send_rate_hz = send_rate_hz
         self.msg_counter = 0
         self.running = False
 
@@ -42,8 +48,12 @@ class FastArrayPublisher:
         self.start_time = None
         self.array = None
 
+        # Constant rate executor
+        self._send_single_executor = ConstantRateExecutor(send_rate_hz, self._send_single)
+        self._stats_executor = ConstantRateExecutor(stats_hz, self._stats_single)
+
         print(f"Publisher bound to ipc://{ipc_path}. Sending at {send_rate_hz} Hz")
-        print(f"Send interval: {self.send_interval * 1000:.3f} ms")
+        print(f"Send rate: {send_rate_hz} Hz, Stats rate: {stats_hz} Hz")
 
     async def send_array(self, array: np.ndarray, topic: str = "data") -> bool:
         """
@@ -65,12 +75,11 @@ class FastArrayPublisher:
             )
 
             # Send multipart message: topic, header, dtype, shape, data
-            await self.socket.send_string(topic, zmq.SNDMORE | zmq.NOBLOCK)
-            await self.socket.send(header, zmq.SNDMORE | zmq.NOBLOCK)
-            await self.socket.send(dtype_code, zmq.SNDMORE | zmq.NOBLOCK)
-            await self.socket.send(shape_data, zmq.SNDMORE | zmq.NOBLOCK)
-
-            await self.socket.send(array, zmq.NOBLOCK, copy=False)
+            await self.socket.send_multipart(
+                [topic.encode("utf-8"), header, dtype_code, shape_data, array],
+                flags=zmq.NOBLOCK,
+                copy=True, # sometimes setting copy=True, might be necessary. Check your use-case
+            )
 
             self.msg_counter += 1
             return True
@@ -78,60 +87,39 @@ class FastArrayPublisher:
         except zmq.Again:
             return False
 
-    async def _send_loop(self):
+    async def _send_single(self):
         """
-        Async loop for sending arrays at constant rate.
+        Send a single array. Used by the constant rate executor.
         """
-        next_send_time = time.perf_counter()
+        # Update array data (simulate changing data)
+        self.array += 0.1
 
-        while self.running:
-            current_time = time.perf_counter()
+        if await self.send_array(self.array):
+            self.sent_count += 1
+        else:
+            self.failed_count += 1
 
-            if current_time >= next_send_time:
-                # Update array data (simulate changing data)
-                self.array += 1
-
-                if await self.send_array(self.array):
-                    self.sent_count += 1
-                else:
-                    self.failed_count += 1
-
-                next_send_time += self.send_interval
-
-            sleep_time = max(0, next_send_time - time.perf_counter())
-            if sleep_time > 0:
-                await asyncio.sleep(min(sleep_time, 0.0001))
-            else:
-                await asyncio.sleep(0)  # Yield control
-
-    async def _stats_loop(self, stats_interval: float = 1.0):
+    async def _stats_single(self):
         """
         Async loop for printing statistics.
         """
-        while self.running:
-            await asyncio.sleep(stats_interval)
+        elapsed = time.perf_counter() - self.start_time
 
-            if not self.running:
-                break
+        if self.sent_count > 0:
+            rate = self.sent_count / elapsed
+            target_rate = self.send_rate_hz
+            accuracy = (rate / target_rate) * 100 if target_rate > 0 else 0
 
-            elapsed = time.perf_counter() - self.start_time
-
-            if self.sent_count > 0:
-                rate = self.sent_count / elapsed
-                target_rate = 1.0 / self.send_interval
-                accuracy = (rate / target_rate) * 100 if target_rate > 0 else 0
-
-                print(
-                    f"Sent: {self.sent_count}, Failed: {self.failed_count}, "
-                    f"Rate: {rate:.6f} Hz (target: {target_rate:.1f}, accuracy: {accuracy:.1f}%), "
-                    f"Elapsed: {elapsed:.1f}s"
-                )
+            print(
+                f"Sent: {self.sent_count}, Failed: {self.failed_count}, "
+                f"Rate: {rate:.6f} Hz (target: {target_rate:.1f}, accuracy: {accuracy:.1f}%), "
+                f"Elapsed: {elapsed:.1f}s"
+            )
 
     async def run_constant_rate(
         self,
         array_shape: tuple = (1000, 1000),
         dtype: np.dtype = np.float32,
-        stats_interval: float = 1.0,
     ):
         """
         Run publisher at constant rate using asyncio.
@@ -154,8 +142,8 @@ class FastArrayPublisher:
         self.running = True
 
         # Create concurrent tasks
-        send_task = asyncio.create_task(self._send_loop())
-        stats_task = asyncio.create_task(self._stats_loop(stats_interval))
+        send_task = asyncio.create_task(self._send_single_executor.run())
+        stats_task = asyncio.create_task(self._stats_executor.run())
 
         tasks = [send_task, stats_task]
 
@@ -167,6 +155,8 @@ class FastArrayPublisher:
             print("\nCancelling publisher tasks...")
         finally:
             self.running = False
+            self._send_single_executor.stop()
+            self._stats_executor.stop()
 
             for task in tasks:
                 if not task.done():
@@ -176,7 +166,7 @@ class FastArrayPublisher:
 
         elapsed = time.perf_counter() - self.start_time
         actual_rate = self.sent_count / elapsed if elapsed > 0 else 0
-        target_rate = 1.0 / self.send_interval
+        target_rate = self.send_rate_hz
 
         print(f"\nFinal stats:")
         print(f"Sent: {self.sent_count}, Failed: {self.failed_count}")
@@ -188,6 +178,9 @@ class FastArrayPublisher:
     async def close(self):
         """Clean shutdown."""
         self.running = False
+        self._send_single_executor.stop()
+        self._stats_executor.stop()
+        print("Closing publisher...")
         self.socket.close()
         self.context.term()
 
@@ -205,7 +198,7 @@ async def main():
     )
     parser.add_argument("--dtype", type=str, default="float32", help="Array data type")
     parser.add_argument(
-        "--stats-interval", type=float, default=1.0, help="Stats printing interval in seconds"
+        "--stats-hz", type=float, default=1.0, help="Stats printing interval in seconds"
     )
 
     args = parser.parse_args()
@@ -216,7 +209,7 @@ async def main():
     publisher = FastArrayPublisher(args.ipc_path, args.rate)
 
     try:
-        await publisher.run_constant_rate(shape, dtype, args.stats_interval)
+        await publisher.run_constant_rate(shape, dtype)
     except KeyboardInterrupt:
         print("\nStopping publisher...")
     finally:
